@@ -14,6 +14,16 @@ class ResolutionError extends Error {
 const ROOT_SOURCE = Object.freeze({ type: 'root' });
 const UPDATE_SOURCE = Object.freeze({ type: 'update' });
 
+// Severity order shared by each package's reported status and by issue
+// sorting; earlier codes take precedence.
+const AUDIT_STATUS_PRIORITY = Object.freeze([
+  'LOCKED_PACKAGE_MISSING',
+  'LOCKED_VERSION_NOT_IN_REGISTRY',
+  'SEMVER_VIOLATION',
+  'CYCLE',
+  'ORPHAN_PACKAGE',
+]);
+
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -627,6 +637,355 @@ function solveUpdate({ catalog, rootRequirements, updateRequirements, locked }) 
     changed,
   };
 }
+function findCatalogEntry(catalog, name, version) {
+  return (catalog.get(name) || []).find((entry) => entry.version === version) || null;
+}
+
+function serializeAuditNode(node) {
+  return {
+    package: node.name,
+    lockedVersion: node.version,
+    requiredRange: node.range,
+    requiredBy: serializeSource(node.source),
+  };
+}
+
+/**
+ * Walk the locked graph from the root without selecting any new versions.
+ * The locked map fixes one version per package, so traversal is a
+ * breadth-first expansion of the locked metadata rather than a search.
+ */
+function auditLockGraph({ catalog, rootRequirements, locked }) {
+  // Canonical shortest path to every locked package reached from the root.
+  // Levels are expanded in lexicographic package order and dependencies are
+  // visited in sorted order, so the first path found is deterministic and
+  // never depends on the caller's key order.
+  const canonicalPath = new Map();
+  const reachable = new Set();
+  // Expansion edges between reachable locked packages whose locked versions
+  // exist in the registry: the real edges of the locked graph.
+  const adjacency = new Map();
+  const issuesByPackage = new Map();
+  const missingReported = new Set();
+
+  function addIssue(name, issue) {
+    if (!issuesByPackage.has(name)) issuesByPackage.set(name, []);
+    issuesByPackage.get(name).push(issue);
+  }
+
+  function pathTo(name) {
+    return canonicalPath.has(name) ? canonicalPath.get(name).map(serializeAuditNode) : [];
+  }
+
+  // Register one dependency edge (root or package) and validate it against
+  // the locked graph. Endpoint is { name, version, range, source } and may
+  // carry a null version when the package is absent from locked.
+  function registerEdge(parentPath, endpoint) {
+    const { name, version, range, source } = endpoint;
+
+    if (version === null) {
+      if (!missingReported.has(name)) {
+        missingReported.add(name);
+        addIssue(name, {
+          code: 'LOCKED_PACKAGE_MISSING',
+          path: [...parentPath.map(serializeAuditNode), serializeAuditNode(endpoint)],
+        });
+      }
+      return;
+    }
+
+    if (!semver.satisfies(version, range)) {
+      addIssue(name, {
+        code: 'SEMVER_VIOLATION',
+        lockedVersion: version,
+        requiredRange: range,
+        requiredBy: serializeSource(source),
+        path: [...parentPath.map(serializeAuditNode), serializeAuditNode(endpoint)],
+      });
+    }
+
+    if (!canonicalPath.has(name)) {
+      canonicalPath.set(name, [...parentPath, endpoint]);
+      reachable.add(name);
+      return endpoint;
+    }
+    return null;
+  }
+
+  let frontier = [];
+  for (const [name, range] of [...rootRequirements.entries()].sort(byName)) {
+    const endpoint = {
+      name,
+      version: locked.has(name) ? locked.get(name) : null,
+      range,
+      source: { ...ROOT_SOURCE },
+    };
+    const queued = registerEdge([], endpoint);
+    if (queued) frontier.push(queued);
+  }
+
+  while (frontier.length > 0) {
+    const next = [];
+    for (const current of frontier) {
+      const entry = findCatalogEntry(catalog, current.name, current.version);
+      if (!entry) continue;
+
+      const parentPath = canonicalPath.get(current.name);
+      const edges = [];
+      adjacency.set(current.name, edges);
+
+      for (const depName of [...entry.dependencies.keys()].sort()) {
+        const range = entry.dependencies.get(depName);
+        const source = { type: 'dependency', package: current.name, version: current.version };
+        const endpoint = {
+          name: depName,
+          version: locked.has(depName) ? locked.get(depName) : null,
+          range,
+          source,
+        };
+        edges.push(depName);
+        const queued = registerEdge(parentPath, endpoint);
+        if (queued) next.push(queued);
+      }
+    }
+    frontier = next;
+  }
+
+  // Locked versions that the graph points at but which the offline registry
+  // does not provide. Orphans (never reached from the root) are reported with
+  // an empty path and handled in the same loop.
+  for (const name of [...locked.keys()].sort()) {
+    const lockedVersion = locked.get(name);
+    if (findCatalogEntry(catalog, name, lockedVersion)) continue;
+    addIssue(name, {
+      code: 'LOCKED_VERSION_NOT_IN_REGISTRY',
+      lockedVersion,
+      availableVersions: (catalog.get(name) || []).map((entry) => entry.version),
+      path: pathTo(name),
+    });
+  }
+
+  // Keep only real edges: both endpoints reachable locked packages whose
+  // locked versions exist in the registry.
+  for (const [from, edges] of [...adjacency.entries()]) {
+    adjacency.set(
+      from,
+      [...new Set(edges)].filter((to) => adjacency.has(to)).sort()
+    );
+  }
+  const vertices = [...adjacency.keys()].sort();
+  const reverse = new Map(vertices.map((name) => [name, []]));
+  for (const from of vertices) {
+    for (const to of adjacency.get(from)) reverse.get(to).push(from);
+  }
+
+  // Iterative Kosaraju: finishing order on the graph, then reversed DFS.
+  const finished = [];
+  const seen = new Set();
+  for (const start of vertices) {
+    if (seen.has(start)) continue;
+    const stack = [{ name: start, index: 0 }];
+    seen.add(start);
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1];
+      const edges = adjacency.get(frame.name);
+      if (frame.index < edges.length) {
+        const nextName = edges[frame.index];
+        frame.index += 1;
+        if (!seen.has(nextName)) {
+          seen.add(nextName);
+          stack.push({ name: nextName, index: 0 });
+        }
+      } else {
+        finished.push(frame.name);
+        stack.pop();
+      }
+    }
+  }
+
+  const components = [];
+  const assigned = new Set();
+  for (let i = finished.length - 1; i >= 0; i -= 1) {
+    const start = finished[i];
+    if (assigned.has(start)) continue;
+    const members = [];
+    const stack = [start];
+    assigned.add(start);
+    while (stack.length > 0) {
+      const name = stack.pop();
+      members.push(name);
+      for (const nextName of reverse.get(name)) {
+        if (!assigned.has(nextName)) {
+          assigned.add(nextName);
+          stack.push(nextName);
+        }
+      }
+    }
+    members.sort();
+    if (members.length > 1 || adjacency.get(members[0]).includes(members[0])) {
+      components.push(members);
+    }
+  }
+  components.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+
+  // Append a node for dependency `name` following the last node of chain,
+  // reading the requiring range from the parent's locked metadata.
+  function appendLockedNode(chain, name) {
+    const parent = chain[chain.length - 1];
+    const parentEntry = findCatalogEntry(catalog, parent.package, parent.lockedVersion);
+    chain.push({
+      package: name,
+      lockedVersion: locked.get(name),
+      requiredRange: parentEntry.dependencies.get(name),
+      requiredBy: {
+        type: 'dependency',
+        package: parent.package,
+        version: parent.lockedVersion,
+      },
+    });
+  }
+
+  for (const members of components) {
+    const start = members[0];
+    const inComponent = new Set(members);
+
+    // Shortest, lexicographically smallest edge chain from start back to
+    // start within the component (excluding the closing edge).
+    const tail = [];
+    if (!adjacency.get(start).includes(start)) {
+      let level = adjacency.get(start)
+        .filter((to) => inComponent.has(to))
+        .map((to) => [to]);
+      const discovered = new Set([start, ...level.map((chain) => chain[0])]);
+      let found = false;
+      while (level.length > 0 && !found) {
+        level = level.map((chain) => [...chain]).sort((a, b) => {
+          for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+            if (a[i] === b[i]) continue;
+            if (a[i] === undefined) return -1;
+            if (b[i] === undefined) return 1;
+            return a[i] < b[i] ? -1 : 1;
+          }
+          return 0;
+        });
+        const nextLevel = [];
+        for (const chain of level) {
+          const current = chain[chain.length - 1];
+          for (const to of adjacency.get(current)) {
+            if (!inComponent.has(to)) continue;
+            if (to === start) {
+              tail.push(...chain);
+              found = true;
+              break;
+            }
+            if (!discovered.has(to)) {
+              discovered.add(to);
+              nextLevel.push([...chain, to]);
+            }
+          }
+          if (found) break;
+        }
+        level = nextLevel;
+      }
+    }
+
+    const chain = pathTo(start);
+    for (const name of tail) appendLockedNode(chain, name);
+    appendLockedNode(chain, start);
+
+    const cycleIssue = {
+      code: 'CYCLE',
+      packages: members.map((name) => ({ package: name, lockedVersion: locked.get(name) })),
+      path: chain,
+    };
+    for (const name of members) addIssue(name, cycleIssue);
+  }
+
+  // Locked packages that no root requirement reaches; reachability from
+  // another orphan does not count.
+  for (const [name, version] of [...locked.entries()].sort(byName)) {
+    if (!reachable.has(name)) {
+      addIssue(name, {
+        code: 'ORPHAN_PACKAGE',
+        lockedVersion: version,
+        path: [],
+      });
+    }
+  }
+
+  function compareIssues(a, b) {
+    const priorityDiff = AUDIT_STATUS_PRIORITY.indexOf(a.code) - AUDIT_STATUS_PRIORITY.indexOf(b.code);
+    if (priorityDiff !== 0) return priorityDiff;
+
+    const rangeA = a.requiredRange === undefined ? '' : a.requiredRange;
+    const rangeB = b.requiredRange === undefined ? '' : b.requiredRange;
+    if (rangeA !== rangeB) return rangeA < rangeB ? -1 : 1;
+
+    const sourceA = a.requiredBy === undefined ? null : a.requiredBy;
+    const sourceB = b.requiredBy === undefined ? null : b.requiredBy;
+    if (sourceA !== sourceB) {
+      if (sourceA === null) return -1;
+      if (sourceB === null) return 1;
+      const sourceResult = compareSource({ ...sourceA }, { ...sourceB });
+      if (sourceResult !== 0) return sourceResult;
+    }
+
+    const pathA = a.path.map((node) => node.package).join(' ');
+    const pathB = b.path.map((node) => node.package).join(' ');
+    if (pathA !== pathB) return pathA < pathB ? -1 : 1;
+    return 0;
+  }
+
+  const allNames = [...new Set([...locked.keys(), ...issuesByPackage.keys()])].sort();
+  const packages = allNames.map((name) => {
+    const issues = [];
+    for (const issue of issuesByPackage.get(name) || []) {
+      if (!issues.includes(issue)) issues.push(issue);
+    }
+    issues.sort(compareIssues);
+
+    const status = issues.length === 0 ? 'OK' : issues[0].code;
+
+    return {
+      package: name,
+      lockedVersion: locked.has(name) ? locked.get(name) : null,
+      status,
+      issues,
+    };
+  });
+
+  const statusCounts = { OK: 0 };
+  for (const code of AUDIT_STATUS_PRIORITY) statusCounts[code] = 0;
+  for (const entry of packages) statusCounts[entry.status] += 1;
+
+  const issueCounts = {};
+  for (const code of AUDIT_STATUS_PRIORITY) issueCounts[code] = 0;
+  for (const entry of packages) {
+    for (const issue of entry.issues) issueCounts[issue.code] += 1;
+  }
+
+  const issuesTotal = packages.reduce((total, entry) => total + entry.issues.length, 0);
+
+  return {
+    ok: issuesTotal === 0,
+    packages,
+    summary: {
+      totalPackages: packages.length,
+      rootReachablePackages: reachable.size,
+      orphanPackages: issueCounts.ORPHAN_PACKAGE,
+      statusCounts,
+      issueCounts,
+      issuesTotal,
+    },
+  };
+}
+
+function auditLockfile(input) {
+  const { catalog, rootRequirements } = normalizeInput(input);
+  const locked = normalizeLocked(input.locked);
+  return auditLockGraph({ catalog, rootRequirements, locked });
+}
+
 
 function resolve(input) {
   return solve(normalizeInput(input));
@@ -641,6 +1000,7 @@ function planUpdate(input) {
 
 module.exports = {
   ResolutionError,
+  auditLockfile,
   normalizeInput,
   planUpdate,
   resolve,

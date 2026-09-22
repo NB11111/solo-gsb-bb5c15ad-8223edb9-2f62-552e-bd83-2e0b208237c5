@@ -13,6 +13,7 @@ docker compose up --build -d
 - 健康检查：`http://localhost:3000/health`
 - 解析接口：`http://localhost:3000/resolve`
 - 更新计划接口：`http://localhost:3000/update-plan`
+- 锁文件审计接口：`http://localhost:3000/lockfile-audit`
 
 停止服务：
 
@@ -160,6 +161,138 @@ curl -s -X POST http://localhost:3000/update-plan \
 - `changed`：新增（`from: null`）、删除（`to: null`）与换版（`from`/`to` 均非空）的包，按包名字典序。
 - 无解时返回 `409 Conflict`，结构与 `/resolve` 相同；由 `update` 引入的约束在冲突链中标记为 `{ "type": "update" }`。
 - `locked` 中的版本或 `update` 中的范围非法时返回 `400 Bad Request`。
+
+### `POST /lockfile-audit`
+
+对既有锁文件做只读校验：服务**不会选择新版本**，而是完全沿 `locked` 版本图展开，逐个核对根约束与传递依赖。请求体：
+
+- `registry`、`root`：与 `/resolve` 相同（依赖范围仍以 registry 中锁定版本的元数据为准）。
+- `locked`：当前锁定版本，按“包名 → 版本”组织；版本必须是合法 semver。
+
+审计沿锁定图从 `root` 做广度优先展开，检查以下五类问题：
+
+| 状态码（`status` / issue `code`） | 含义 |
+| --- | --- |
+| `SEMVER_VIOLATION` | 锁定版本不满足某条 semver 依赖（含根约束） |
+| `LOCKED_PACKAGE_MISSING` | 根或某个锁定包依赖的包完全没有出现在 `locked` 中 |
+| `LOCKED_VERSION_NOT_IN_REGISTRY` | 锁定版本在离线 registry 中不存在 |
+| `CYCLE` | 可达的锁定包之间存在依赖环 |
+| `ORPHAN_PACKAGE` | 锁定包无法从 `root` 到达（被另一个孤立包引用不算可达） |
+
+示例（锁文件把 `lib` 锁在了不满足 `^2.0.0` 的 `1.5.0`，且包含一个孤立包）：
+
+```bash
+curl -s -X POST http://localhost:3000/lockfile-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "registry": {
+      "app": { "1.0.0": { "dependencies": { "lib": "^2.0.0" } } },
+      "lib": { "2.0.0": {}, "1.5.0": {} },
+      "unused": { "1.0.0": {} }
+    },
+    "root": {
+      "app": "1.0.0"
+    },
+    "locked": {
+      "app": "1.0.0",
+      "lib": "1.5.0",
+      "unused": "1.0.0"
+    }
+  }'
+```
+
+无任何问题时返回 `200`，发现问题时返回 `409 Conflict`，响应结构相同：
+
+```json
+{
+  "ok": false,
+  "packages": [
+    {
+      "package": "app",
+      "lockedVersion": "1.0.0",
+      "status": "OK",
+      "issues": []
+    },
+    {
+      "package": "lib",
+      "lockedVersion": "1.5.0",
+      "status": "SEMVER_VIOLATION",
+      "issues": [
+        {
+          "code": "SEMVER_VIOLATION",
+          "lockedVersion": "1.5.0",
+          "requiredRange": "^2.0.0",
+          "requiredBy": {
+            "type": "dependency",
+            "package": "app",
+            "version": "1.0.0"
+          },
+          "path": [
+            {
+              "package": "app",
+              "lockedVersion": "1.0.0",
+              "requiredRange": "1.0.0",
+              "requiredBy": { "type": "root" }
+            },
+            {
+              "package": "lib",
+              "lockedVersion": "1.5.0",
+              "requiredRange": "^2.0.0",
+              "requiredBy": {
+                "type": "dependency",
+                "package": "app",
+                "version": "1.0.0"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "package": "unused",
+      "lockedVersion": "1.0.0",
+      "status": "ORPHAN_PACKAGE",
+      "issues": [
+        {
+          "code": "ORPHAN_PACKAGE",
+          "lockedVersion": "1.0.0",
+          "path": []
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "totalPackages": 3,
+    "rootReachablePackages": 2,
+    "orphanPackages": 1,
+    "statusCounts": {
+      "OK": 1,
+      "LOCKED_PACKAGE_MISSING": 0,
+      "LOCKED_VERSION_NOT_IN_REGISTRY": 0,
+      "SEMVER_VIOLATION": 1,
+      "CYCLE": 0,
+      "ORPHAN_PACKAGE": 1
+    },
+    "issueCounts": {
+      "LOCKED_PACKAGE_MISSING": 0,
+      "LOCKED_VERSION_NOT_IN_REGISTRY": 0,
+      "SEMVER_VIOLATION": 1,
+      "CYCLE": 0,
+      "ORPHAN_PACKAGE": 1
+    },
+    "issuesTotal": 2
+  }
+}
+```
+
+审计响应说明：
+
+- `packages` 按包名字典序排序，既包含全部锁定包，也包含被依赖但未锁定的包（其 `lockedVersion` 为 `null`）。
+- 每个包的 `status` 取其问题中优先级最高者；优先级顺序即上表状态码的顺序（`LOCKED_PACKAGE_MISSING` 最高，`ORPHAN_PACKAGE` 最低），无问题时为 `OK`。
+- 每个 issue 的 `path` 是可定位的依赖路径：从根开始逐跳给出包名、锁定版本、该跳收到的 semver 范围及来源（`root` 或 `package@version`）；路径取从根到该包的最短且字典序稳定的一条。孤立包路径为空数组；环路径从根延伸到环上字典序最小的包，并沿环走一圈回到该包。
+- `CYCLE` issue 额外给出 `packages`（环内全部包）；`LOCKED_VERSION_NOT_IN_REGISTRY` 额外给出 `availableVersions`。
+- `summary.statusCounts` 按包统计状态，`summary.issueCounts` 按问题条目统计（一个包可同时有多条问题）。
+- `locked` 缺失、版本非法或 `root` 范围非法时返回 `400 Bad Request`。
 
 ## 解析与稳定性规则
 
