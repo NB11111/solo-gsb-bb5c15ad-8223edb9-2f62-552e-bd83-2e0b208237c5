@@ -194,3 +194,130 @@ test('POST /update-plan rejects invalid locked versions and update ranges', asyn
     server.close();
   }
 });
+
+test('POST /lockfile-audit returns 200 for a clean locked graph', async () => {
+  const server = await listen(createApp());
+  try {
+    const response = await request(server, '/lockfile-audit', {
+      method: 'POST',
+      body: {
+        registry: {
+          app: { '1.0.0': { dependencies: { lib: '^1.0.0' } } },
+          lib: { '1.2.0': {} },
+        },
+        root: { app: '1.0.0' },
+        locked: { app: '1.0.0', lib: '1.2.0' },
+      },
+    });
+
+    assert.equal(response.status, 200);
+    assert.equal(response.body.ok, true);
+    assert.deepEqual(response.body.packages.map((pkg) => pkg.package), ['app', 'lib']);
+    assert.deepEqual(response.body.summary.statuses, {
+      ok: 2,
+      orphan: 0,
+      error: 0,
+      missing: 0,
+    });
+    assert.deepEqual(response.body.cycles, []);
+  } finally {
+    server.close();
+  }
+});
+
+test('POST /lockfile-audit returns 409 with located issues and summary counts', async () => {
+  const server = await listen(createApp());
+  try {
+    const response = await request(server, '/lockfile-audit', {
+      method: 'POST',
+      body: {
+        registry: {
+          app: { '1.0.0': { dependencies: { lib: '^2.0.0', ghost: '^1.0.0' } } },
+          lib: { '1.5.0': {} },
+        },
+        root: { app: '^1.0.0' },
+        locked: { app: '1.0.0', lib: '1.5.0', extra: '9.0.0' },
+      },
+    });
+
+    assert.equal(response.status, 409);
+    assert.equal(response.body.ok, false);
+    assert.deepEqual(response.body.packages.map((pkg) => pkg.package), [
+      'app',
+      'extra',
+      'ghost',
+      'lib',
+    ]);
+
+    const lib = response.body.packages.find((pkg) => pkg.package === 'lib');
+    assert.equal(lib.status, 'error');
+    assert.equal(lib.issues[0].code, 'LOCKED_VERSION_RANGE_VIOLATION');
+    assert.deepEqual(lib.issues[0].path.map((node) => node.package), ['app', 'lib']);
+
+    const ghost = response.body.packages.find((pkg) => pkg.package === 'ghost');
+    assert.equal(ghost.status, 'missing');
+    assert.equal(ghost.version, null);
+
+    const extra = response.body.packages.find((pkg) => pkg.package === 'extra');
+    assert.equal(extra.status, 'error');
+    assert.equal(extra.issues[0].code, 'LOCKED_VERSION_NOT_IN_REGISTRY');
+
+    assert.equal(response.body.summary.lockedPackages, 3);
+    assert.equal(response.body.summary.orphans, 1);
+    assert.equal(response.body.summary.missing, 1);
+    assert.equal(response.body.summary.issues, 3);
+    assert.equal(response.body.summary.byCode.LOCKED_VERSION_RANGE_VIOLATION, 1);
+    assert.equal(response.body.summary.byCode.DEPENDENCY_NOT_LOCKED, 1);
+    assert.equal(response.body.summary.byCode.LOCKED_VERSION_NOT_IN_REGISTRY, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test('POST /lockfile-audit reports cycles with 409', async () => {
+  const server = await listen(createApp());
+  try {
+    const response = await request(server, '/lockfile-audit', {
+      method: 'POST',
+      body: {
+        registry: {
+          a: { '1.0.0': { dependencies: { b: '1.0.0' } } },
+          b: { '1.0.0': { dependencies: { a: '1.0.0' } } },
+        },
+        root: { a: '1.0.0' },
+        locked: { a: '1.0.0', b: '1.0.0' },
+      },
+    });
+
+    assert.equal(response.status, 409);
+    assert.equal(response.body.summary.cycles, 1);
+    assert.deepEqual(response.body.cycles[0].packages, ['a', 'b']);
+    assert.deepEqual(
+      response.body.cycles[0].path.map((node) => node.package),
+      ['a', 'b', 'a']
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test('POST /lockfile-audit rejects malformed requests with 400', async () => {
+  const server = await listen(createApp());
+  try {
+    const missingLocked = await request(server, '/lockfile-audit', {
+      method: 'POST',
+      body: { registry: {}, root: {} },
+    });
+    assert.equal(missingLocked.status, 400);
+    assert.equal(missingLocked.body.error, 'INVALID_REQUEST');
+
+    const badVersion = await request(server, '/lockfile-audit', {
+      method: 'POST',
+      body: { registry: {}, root: {}, locked: { app: 'not-a-version' } },
+    });
+    assert.equal(badVersion.status, 400);
+    assert.equal(badVersion.body.error, 'INVALID_REQUEST');
+  } finally {
+    server.close();
+  }
+});

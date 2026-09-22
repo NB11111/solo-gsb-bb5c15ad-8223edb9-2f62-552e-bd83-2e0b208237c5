@@ -628,6 +628,457 @@ function solveUpdate({ catalog, rootRequirements, updateRequirements, locked }) 
   };
 }
 
+// --- Lockfile audit ---------------------------------------------------------
+
+const AUDIT_ISSUE_CODES = Object.freeze([
+  'ROOT_DEPENDENCY_NOT_LOCKED',
+  'ROOT_RANGE_VIOLATION',
+  'DEPENDENCY_NOT_LOCKED',
+  'LOCKED_VERSION_RANGE_VIOLATION',
+  'LOCKED_VERSION_NOT_IN_REGISTRY',
+  'CYCLE',
+]);
+
+function auditSourceKey(requiredBy) {
+  if (!requiredBy) return '';
+  if (requiredBy.type === 'root') return 'root';
+  return `${requiredBy.package}@${requiredBy.version}`;
+}
+
+function auditPathKey(path) {
+  return path
+    .map((node) => `${node.name}@${node.version === null ? '' : node.version}`)
+    .join('>');
+}
+
+function compareAuditIssues(a, b) {
+  const rankA = AUDIT_ISSUE_CODES.indexOf(a.code);
+  const rankB = AUDIT_ISSUE_CODES.indexOf(b.code);
+  if (rankA !== rankB) return rankA - rankB;
+  const rangeA = a.requiredRange || '';
+  const rangeB = b.requiredRange || '';
+  if (rangeA !== rangeB) return rangeA < rangeB ? -1 : 1;
+  const sourceA = auditSourceKey(a.requiredBy);
+  const sourceB = auditSourceKey(b.requiredBy);
+  if (sourceA !== sourceB) return sourceA < sourceB ? -1 : 1;
+  const pathA = auditPathKey(a.path);
+  const pathB = auditPathKey(b.path);
+  return pathA < pathB ? -1 : pathA > pathB ? 1 : 0;
+}
+
+/**
+ * BFS predecessor for every locked package reachable from a root
+ * requirement. Roots are expanded in name order and a package's locked
+ * dependencies are sorted by name, so the first BFS visit always follows
+ * the shortest, then lexicographically smallest root-to-package chain.
+ * Storing predecessors (rather than a full path per package) keeps the
+ * traversal O(n); paths are reconstructed on demand.
+ */
+function buildRootPredecessors(rootRequirements, lockedVersions, edges) {
+  const predecessor = new Map();
+  const queue = [];
+
+  for (const [name, range] of [...rootRequirements.entries()].sort(byName)) {
+    if (lockedVersions.has(name) && !predecessor.has(name)) {
+      predecessor.set(name, { from: null, range });
+      queue.push(name);
+    }
+  }
+
+  for (let head = 0; head < queue.length; head += 1) {
+    const current = queue[head];
+    for (const edge of edges.get(current) || []) {
+      if (lockedVersions.has(edge.name) && !predecessor.has(edge.name)) {
+        predecessor.set(edge.name, { from: current, range: edge.range });
+        queue.push(edge.name);
+      }
+    }
+  }
+
+  return predecessor;
+}
+
+function reconstructRootPath(name, predecessor, lockedVersions) {
+  const nodes = [];
+  let cursor = name;
+  while (cursor !== null) {
+    const pred = predecessor.get(cursor);
+    nodes.push({
+      name: cursor,
+      version: lockedVersions.get(cursor),
+      range: pred.range,
+      // null marks the root edge; undefined marks an orphan chain start.
+      requiredBy: pred.from === null ? null : { package: pred.from, version: lockedVersions.get(pred.from) },
+    });
+    cursor = pred.from;
+  }
+  return nodes.reverse();
+}
+
+function buildEdgePath(sourceName, edge, rootPredecessors, lockedVersions) {
+  const targetNode = {
+    name: edge.name,
+    version: lockedVersions.has(edge.name) ? lockedVersions.get(edge.name) : null,
+    range: edge.range,
+    requiredBy: { package: sourceName, version: lockedVersions.get(sourceName) },
+  };
+
+  if (rootPredecessors.has(sourceName)) {
+    return [...reconstructRootPath(sourceName, rootPredecessors, lockedVersions), targetNode];
+  }
+
+  return [
+    { name: sourceName, version: lockedVersions.get(sourceName), range: undefined, requiredBy: undefined },
+    targetNode,
+  ];
+}
+
+function serializeAuditPath(path) {
+  if (path === null) return null;
+  return path.map((node) => {
+    const serialized = { package: node.name, version: node.version };
+    if (node.range !== undefined) serialized.requiredRange = node.range;
+    if (node.requiredBy === null) {
+      serialized.requiredBy = { type: 'root' };
+    } else if (node.requiredBy === undefined) {
+      serialized.requiredBy = null;
+    } else {
+      serialized.requiredBy = {
+        type: 'dependency',
+        package: node.requiredBy.package,
+        version: node.requiredBy.version,
+      };
+    }
+    return serialized;
+  });
+}
+
+function serializeAuditIssue(issue) {
+  const result = { code: issue.code };
+  if (issue.lockedVersion !== undefined) result.lockedVersion = issue.lockedVersion;
+  if (issue.requiredRange !== undefined) result.requiredRange = issue.requiredRange;
+  if (issue.requiredBy !== undefined) {
+    result.requiredBy = issue.requiredBy === null
+      ? { type: 'root' }
+      : { type: 'dependency', package: issue.requiredBy.package, version: issue.requiredBy.version };
+  }
+  result.path = serializeAuditPath(issue.path);
+  return result;
+}
+
+/**
+ * Find the SCCs of the locked graph with iterative Kosaraju so deep graphs
+ * cannot overflow the call stack. Adjacency lists are pre-sorted by
+ * dependency name, which makes both passes and the resulting component
+ * ordering independent of object key order.
+ */
+function findCyclicComponents(nodes, edges) {
+  const lockedNodes = new Set(nodes);
+  const visited = new Set();
+  const finishOrder = [];
+
+  for (const start of nodes) {
+    if (visited.has(start)) continue;
+    const stack = [{ node: start, edgeIndex: 0 }];
+    visited.add(start);
+
+    while (stack.length > 0) {
+      const frame = stack[stack.length - 1];
+      const neighbors = edges.get(frame.node) || [];
+      if (frame.edgeIndex < neighbors.length) {
+        const next = neighbors[frame.edgeIndex].name;
+        frame.edgeIndex += 1;
+        // Cycles are defined over the locked graph only; unlocked targets
+        // have no recorded outgoing edges and cannot close a loop.
+        if (lockedNodes.has(next) && !visited.has(next)) {
+          visited.add(next);
+          stack.push({ node: next, edgeIndex: 0 });
+        }
+      } else {
+        finishOrder.push(frame.node);
+        stack.pop();
+      }
+    }
+  }
+
+  const reverseEdges = new Map();
+  for (const source of nodes) {
+    for (const edge of edges.get(source) || []) {
+      if (!lockedNodes.has(edge.name)) continue;
+      if (!reverseEdges.has(edge.name)) reverseEdges.set(edge.name, []);
+      reverseEdges.get(edge.name).push({ name: source, range: edge.range });
+    }
+  }
+
+  const components = [];
+  const assigned = new Set();
+
+  for (let i = finishOrder.length - 1; i >= 0; i -= 1) {
+    const start = finishOrder[i];
+    if (assigned.has(start)) continue;
+
+    const members = [];
+    const stack = [start];
+    assigned.add(start);
+    while (stack.length > 0) {
+      const node = stack.pop();
+      members.push(node);
+      for (const edge of reverseEdges.get(node) || []) {
+        if (!assigned.has(edge.name)) {
+          assigned.add(edge.name);
+          stack.push(edge.name);
+        }
+      }
+    }
+    members.sort();
+    if (members.length > 1 || (edges.get(members[0]) || []).some((edge) => edge.name === members[0])) {
+      components.push(members);
+    }
+  }
+
+  components.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  return components;
+}
+
+/**
+ * Deterministic representative cycle for an SCC: the shortest cycle from the
+ * smallest member back to itself, breaking ties by successor name. Edges are
+ * traversed in name order, so BFS discovers the lexicographically smallest
+ * such cycle first. Returns BFS predecessor data; the path is reconstructed
+ * only when the cycle is serialized.
+ */
+function findCycleClosure(members, start, edges) {
+  const inComponent = new Set(members);
+  const predecessor = new Map();
+  const queue = [start];
+  let closing = null;
+
+  for (let head = 0; head < queue.length && closing === null; head += 1) {
+    const current = queue[head];
+    for (const edge of edges.get(current) || []) {
+      if (!inComponent.has(edge.name)) continue;
+      if (edge.name === start) {
+        closing = { from: current, range: edge.range };
+        break;
+      }
+      if (!predecessor.has(edge.name)) {
+        predecessor.set(edge.name, { from: current, range: edge.range });
+        queue.push(edge.name);
+      }
+    }
+  }
+
+  return { predecessor, closing };
+}
+
+function buildCyclePath(members, start, edges, rootPredecessors, lockedVersions) {
+  const { predecessor, closing } = findCycleClosure(members, start, edges);
+
+  // Successor nodes n1, ..., nk, start (the closing node repeats the start).
+  const successors = [{
+    name: start,
+    range: closing.range,
+    requiredBy: { package: closing.from, version: lockedVersions.get(closing.from) },
+  }];
+  let cursor = closing.from;
+  while (cursor !== start) {
+    const pred = predecessor.get(cursor);
+    successors.push({
+      name: cursor,
+      range: pred.range,
+      requiredBy: { package: pred.from, version: lockedVersions.get(pred.from) },
+    });
+    cursor = pred.from;
+  }
+  successors.reverse();
+
+  if (rootPredecessors.has(start)) {
+    return [...reconstructRootPath(start, rootPredecessors, lockedVersions), ...successors];
+  }
+  return [
+    { name: start, version: lockedVersions.get(start), range: undefined, requiredBy: undefined },
+    ...successors,
+  ];
+}
+
+function auditLockfile(input) {
+  const { catalog, rootRequirements } = normalizeInput(input);
+  const lockedVersions = normalizeLocked(input.locked);
+
+  // Metadata for each locked version, taken as recorded — no re-selection.
+  const lockedEntries = [...lockedVersions.entries()].sort(byName).map(([name, version]) => {
+    const registryVersions = catalog.get(name) || [];
+    const registryEntry = registryVersions.find((entry) => entry.version === version) || null;
+    return { name, version, registryEntry };
+  });
+
+  // Locked graph: edges are known only when the locked version is in the
+  // registry, and only edges pointing at locked packages participate.
+  const edges = new Map();
+  for (const { name, registryEntry } of lockedEntries) {
+    if (!registryEntry) continue;
+    edges.set(
+      name,
+      [...registryEntry.dependencies.entries()]
+        .sort(byName)
+        .map(([dependencyName, range]) => ({ name: dependencyName, range }))
+    );
+  }
+
+  const rootPredecessors = buildRootPredecessors(rootRequirements, lockedVersions, edges);
+
+  // Issues grouped by the package they describe (target-centric). Targets
+  // may be referenced packages that are absent from `locked`.
+  const issues = new Map();
+
+  function addIssue(target, issue) {
+    if (!issues.has(target)) issues.set(target, []);
+    issues.get(target).push(issue);
+  }
+
+  // 1. Root requirements against the locked graph.
+  for (const [name, range] of [...rootRequirements.entries()].sort(byName)) {
+    if (!lockedVersions.has(name)) {
+      addIssue(name, {
+        code: 'ROOT_DEPENDENCY_NOT_LOCKED',
+        requiredRange: range,
+        requiredBy: null,
+        path: [{ name, version: null, range, requiredBy: null }],
+      });
+    } else if (!semver.satisfies(lockedVersions.get(name), range)) {
+      addIssue(name, {
+        code: 'ROOT_RANGE_VIOLATION',
+        lockedVersion: lockedVersions.get(name),
+        requiredRange: range,
+        requiredBy: null,
+        path: reconstructRootPath(name, rootPredecessors, lockedVersions),
+      });
+    }
+  }
+
+  // 2. Every locked package's recorded semver dependencies.
+  for (const { name: sourceName, version: sourceVersion, registryEntry } of lockedEntries) {
+    if (!registryEntry) continue;
+    for (const edge of edges.get(sourceName)) {
+      if (!lockedVersions.has(edge.name)) {
+        addIssue(edge.name, {
+          code: 'DEPENDENCY_NOT_LOCKED',
+          requiredRange: edge.range,
+          requiredBy: { package: sourceName, version: sourceVersion },
+          path: buildEdgePath(sourceName, edge, rootPredecessors, lockedVersions),
+        });
+      } else if (!semver.satisfies(lockedVersions.get(edge.name), edge.range)) {
+        addIssue(edge.name, {
+          code: 'LOCKED_VERSION_RANGE_VIOLATION',
+          lockedVersion: lockedVersions.get(edge.name),
+          requiredRange: edge.range,
+          requiredBy: { package: sourceName, version: sourceVersion },
+          path: buildEdgePath(sourceName, edge, rootPredecessors, lockedVersions),
+        });
+      }
+    }
+  }
+
+  // 3. Locked versions that the offline registry no longer provides.
+  for (const { name, registryEntry } of lockedEntries) {
+    if (!registryEntry) {
+      addIssue(name, {
+        code: 'LOCKED_VERSION_NOT_IN_REGISTRY',
+        path: rootPredecessors.has(name)
+          ? reconstructRootPath(name, rootPredecessors, lockedVersions)
+          : null,
+      });
+    }
+  }
+
+  // 4. Cycles inside the locked graph.
+  const cycles = [];
+  const cyclicComponents = findCyclicComponents(
+    lockedEntries.map((entry) => entry.name),
+    edges
+  );
+  for (const members of cyclicComponents) {
+    const start = members[0];
+    const path = buildCyclePath(
+      members,
+      start,
+      edges,
+      rootPredecessors,
+      lockedVersions
+    );
+    cycles.push({ packages: members, path });
+    for (const member of members) {
+      addIssue(member, { code: 'CYCLE', path });
+    }
+  }
+
+  const statuses = { ok: 0, orphan: 0, error: 0, missing: 0 };
+  const referencedNames = new Set(issues.keys());
+  const packageNames = [...new Set([...lockedVersions.keys(), ...referencedNames])].sort();
+
+  const packages = packageNames.map((name) => {
+    const packageIssues = (issues.get(name) || []).slice().sort(compareAuditIssues);
+
+    if (lockedVersions.has(name)) {
+      const version = lockedVersions.get(name);
+      const reachable = rootPredecessors.has(name);
+      const status = packageIssues.length > 0 ? 'error' : reachable ? 'ok' : 'orphan';
+      statuses[status] += 1;
+      return {
+        package: name,
+        version,
+        status,
+        reachable,
+        path: serializeAuditPath(
+          reachable ? reconstructRootPath(name, rootPredecessors, lockedVersions) : null
+        ),
+        issues: packageIssues.map(serializeAuditIssue),
+      };
+    }
+
+    statuses.missing += 1;
+    return {
+      package: name,
+      version: null,
+      status: 'missing',
+      reachable: false,
+      path: null,
+      issues: packageIssues.map(serializeAuditIssue),
+    };
+  });
+
+  const byCode = {};
+  for (const code of AUDIT_ISSUE_CODES) byCode[code] = 0;
+  let issueCount = 0;
+  for (const packageIssues of issues.values()) {
+    for (const issue of packageIssues) {
+      byCode[issue.code] += 1;
+      issueCount += 1;
+    }
+  }
+
+  const orphanCount = lockedEntries.filter(({ name }) => !rootPredecessors.has(name)).length;
+
+  return {
+    ok: issueCount === 0 && orphanCount === 0,
+    summary: {
+      lockedPackages: lockedVersions.size,
+      reachable: lockedVersions.size - orphanCount,
+      orphans: orphanCount,
+      missing: statuses.missing,
+      cycles: cyclicComponents.length,
+      issues: issueCount,
+      byCode,
+      statuses,
+    },
+    packages,
+    cycles: cycles.map((cycle) => ({
+      packages: cycle.packages,
+      path: serializeAuditPath(cycle.path),
+    })),
+  };
+}
+
 function resolve(input) {
   return solve(normalizeInput(input));
 }
@@ -641,6 +1092,7 @@ function planUpdate(input) {
 
 module.exports = {
   ResolutionError,
+  auditLockfile,
   normalizeInput,
   planUpdate,
   resolve,

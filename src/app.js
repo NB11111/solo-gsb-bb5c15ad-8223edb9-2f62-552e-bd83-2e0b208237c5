@@ -1,7 +1,7 @@
 'use strict';
 
 const express = require('express');
-const { resolve, planUpdate, ResolutionError } = require('./resolver');
+const { resolve, planUpdate, auditLockfile, ResolutionError } = require('./resolver');
 
 function createApp() {
   const app = express();
@@ -33,6 +33,18 @@ function createApp() {
     try {
       const result = planUpdate(req.body);
       if (result.satisfiable) {
+        return res.json(result);
+      }
+      return res.status(409).json(result);
+    } catch (error) {
+      return next(error);
+    }
+  });
+
+  app.post('/lockfile-audit', (req, res, next) => {
+    try {
+      const result = auditLockfile(req.body);
+      if (result.ok) {
         return res.json(result);
       }
       return res.status(409).json(result);

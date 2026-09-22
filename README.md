@@ -13,6 +13,7 @@ docker compose up --build -d
 - 健康检查：`http://localhost:3000/health`
 - 解析接口：`http://localhost:3000/resolve`
 - 更新计划接口：`http://localhost:3000/update-plan`
+- 锁文件审计接口：`http://localhost:3000/lockfile-audit`
 
 停止服务：
 
@@ -91,8 +92,8 @@ curl -s -X POST http://localhost:3000/resolve \
 {
   "satisfiable": true,
   "plan": [
-    { "package": "app", version": "1.1.0" },
-    { "package": "lib", version": "1.5.0" }
+    { "package": "app", "version": "1.1.0" },
+    { "package": "lib", "version": "1.5.0" }
   ]
 }
 ```
@@ -160,6 +161,142 @@ curl -s -X POST http://localhost:3000/update-plan \
 - `changed`：新增（`from: null`）、删除（`to: null`）与换版（`from`/`to` 均非空）的包，按包名字典序。
 - 无解时返回 `409 Conflict`，结构与 `/resolve` 相同；由 `update` 引入的约束在冲突链中标记为 `{ "type": "update" }`。
 - `locked` 中的版本或 `update` 中的范围非法时返回 `400 Bad Request`。
+
+### `POST /lockfile-audit`
+
+对**已锁定**的版本图做只读校验。服务不会选择或建议新版本：`locked` 中每个包固定使用其锁定版本，沿锁定图展开并核对 registry 中该版本记录的依赖声明。请求体：
+
+- `registry`、`root`：与 `/resolve` 相同（`registry.<package>.<version>.dependencies` 提供锁定版本记录的依赖声明）。
+- `locked`：当前锁定版本，按“包名 → 版本”组织；版本必须是合法 semver。
+
+审计内容：
+
+1. 每条 semver 依赖：根约束与传递依赖范围是否被对应锁定版本满足；
+2. 缺失包：被根或锁定包依赖、但不在 `locked` 中的包；
+3. 锁定版本缺失：`locked` 中的版本在离线 registry 中不存在（无法核对其依赖）；
+4. 循环：锁定图中的依赖环（含自环，以及由孤立包构成的环）；
+5. 孤立包：`locked` 中存在、但无法从任一 `root` 依赖沿锁定图到达的包。
+
+示例（`lib` 锁定版本不满足 `^2.0.0`，`tool` 不在 registry 中）：
+
+```bash
+curl -s -X POST http://localhost:3000/lockfile-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "registry": {
+      "app": { "1.0.0": { "dependencies": { "lib": "^2.0.0" } } },
+      "lib": { "1.5.0": {} }
+    },
+    "root": {
+      "app": "^1.0.0"
+    },
+    "locked": {
+      "app": "1.0.0",
+      "lib": "1.5.0",
+      "tool": "3.0.0"
+    }
+  }'
+```
+
+存在任何问题（含孤立包）时返回 `409 Conflict`；全部正常时返回 `200`：
+
+```json
+{
+  "ok": false,
+  "summary": {
+    "lockedPackages": 3,
+    "reachable": 2,
+    "orphans": 1,
+    "missing": 0,
+    "cycles": 0,
+    "issues": 2,
+    "byCode": {
+      "ROOT_DEPENDENCY_NOT_LOCKED": 0,
+      "ROOT_RANGE_VIOLATION": 0,
+      "DEPENDENCY_NOT_LOCKED": 0,
+      "LOCKED_VERSION_RANGE_VIOLATION": 1,
+      "LOCKED_VERSION_NOT_IN_REGISTRY": 1,
+      "CYCLE": 0
+    },
+    "statuses": { "ok": 1, "orphan": 0, "error": 2, "missing": 0 }
+  },
+  "packages": [
+    {
+      "package": "app",
+      "version": "1.0.0",
+      "status": "ok",
+      "reachable": true,
+      "path": [
+        { "package": "app", "version": "1.0.0", "requiredRange": "^1.0.0", "requiredBy": { "type": "root" } }
+      ],
+      "issues": []
+    },
+    {
+      "package": "lib",
+      "version": "1.5.0",
+      "status": "error",
+      "reachable": true,
+      "path": [
+        { "package": "app", "version": "1.0.0", "requiredRange": "^1.0.0", "requiredBy": { "type": "root" } },
+        {
+          "package": "lib",
+          "version": "1.5.0",
+          "requiredRange": "^2.0.0",
+          "requiredBy": { "type": "dependency", "package": "app", "version": "1.0.0" }
+        }
+      ],
+      "issues": [
+        {
+          "code": "LOCKED_VERSION_RANGE_VIOLATION",
+          "lockedVersion": "1.5.0",
+          "requiredRange": "^2.0.0",
+          "requiredBy": { "type": "dependency", "package": "app", "version": "1.0.0" },
+          "path": [
+            { "package": "app", "version": "1.0.0", "requiredRange": "^1.0.0", "requiredBy": { "type": "root" } },
+            {
+              "package": "lib",
+              "version": "1.5.0",
+              "requiredRange": "^2.0.0",
+              "requiredBy": { "type": "dependency", "package": "app", "version": "1.0.0" }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "package": "tool",
+      "version": "3.0.0",
+      "status": "error",
+      "reachable": false,
+      "path": null,
+      "issues": [
+        { "code": "LOCKED_VERSION_NOT_IN_REGISTRY", "path": null }
+      ]
+    }
+  ],
+  "cycles": []
+}
+```
+
+`packages` 按包名字典序排列，既包含全部锁定包，也包含被引用但缺失的包（`version: null`）。每项字段：
+
+- `status`：`ok`（可从 root 到达且无问题）、`orphan`（可到达性之外无其他问题的孤立包）、`error`（锁定包存在审计问题）、`missing`（被依赖但未锁定的包）。
+- `reachable`：是否可从任一 `root` 依赖沿锁定图到达。
+- `path`：从 root 到该包的**最短**可定位依赖路径（等长时按路径节点字典序取最小）；孤立包与缺失包为 `null`。路径节点包含 `package`、`version`、`requiredRange` 与 `requiredBy`（`{ "type": "root" }` 或引入该依赖的包版本）；孤立链起点的 `requiredBy` 为 `null`。
+- `issues`：该包上的问题列表，按问题码、范围、来源与路径稳定排序；每个问题都携带同样结构的可定位 `path`。
+
+问题码：
+
+- `ROOT_RANGE_VIOLATION`：锁定版本不满足 `root` 中的范围。
+- `ROOT_DEPENDENCY_NOT_LOCKED`：`root` 依赖的包不在 `locked` 中。
+- `LOCKED_VERSION_RANGE_VIOLATION`：锁定版本不满足某个锁定包记录的依赖范围。
+- `DEPENDENCY_NOT_LOCKED`：某个锁定包依赖的包不在 `locked` 中。
+- `LOCKED_VERSION_NOT_IN_REGISTRY`：锁定版本在 registry 中不存在，无法展开其依赖。
+- `CYCLE`：该包属于某个依赖环。
+
+`cycles` 列出每个环：`packages` 为环内成员（字典序），`path` 为从环内最小成员出发并回到该成员的确定性代表路径（若可从 root 到达，则带有从 root 出发的前缀）。`summary` 提供 `lockedPackages`、`reachable`、`orphans`、`missing`、`cycles`、`issues` 总数、按问题码分组的 `byCode` 与按状态分组的 `statuses`。
+
+`locked` 缺失、版本非法或请求体结构错误时返回 `400 Bad Request`。审计不依赖对象键顺序，相同输入始终产生相同输出。
 
 ## 解析与稳定性规则
 
